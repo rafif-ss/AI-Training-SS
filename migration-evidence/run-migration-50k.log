@@ -1,0 +1,38 @@
+WHO: local harness (not production)
+DATABASE_URL host used: postgres://postgres:***@127.0.0.1:5434/migration_lab
+ROW_COUNT=50000
+PRODUCTION NOT TOUCHED
+
+=== TEST 1: rename vs old app (zero-downtime claim) ===
+seeded rows: 50000
+old app BEFORE migration: ok, amount=748.34
+running AI up() ...
+AI up() finished in 576 ms
+CONFIRMED  old app AFTER rename failed as expected
+      column "amount" does not exist
+new app column works: total_amount=748.34 currency=EUR
+
+=== TEST 2: CREATE INDEX blocks writers ===
+CREATE INDEX (non-concurrent) took 44 ms
+INSERT finished after waiting 6 ms
+WEAK  table too small / too fast to show blocking clearly — raise ROW_COUNT and retry
+
+=== TEST 3: down() is not fully reversible ===
+currency distribution BEFORE down():
+  EUR: 16667
+  IDR: 16667
+  USD: 16666
+columns after down(): id, country, amount, created_at
+index invoices_currency_idx still present: false (expected false: dropped with currency column)
+constraint amount_nonneg still present: true
+  definition: CHECK ((amount >= (0)::numeric))
+currency column present: false
+CONFIRMED  down() is incomplete: CHECK amount_nonneg remains; currency data is gone (not restored)
+NOTE  index on currency went away with DROP COLUMN — do not cite that index as a leftover
+
+=== SUMMARY ===
+rename breaks old app: SHOWN
+index lock test ran:   YES
+down() incomplete:     SHOWN
+
+Next: paste this raw output into Evidence. Staging 1.8s is still not production proof.

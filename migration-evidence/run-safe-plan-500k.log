@@ -1,0 +1,104 @@
+WHO: local harness (not production), prove-safe-plan.js
+DATABASE_URL host used: postgres://postgres:***@127.0.0.1:5434/migration_lab
+ROW_COUNT=500000 TX_ROW_COUNT=200000 WRITERS=4
+PRODUCTION NOT TOUCHED. Replica lag NOT measured. Writers are not a calibrated 800 inserts/s.
+
+=== TEST 4: expand-only step keeps old pods working (ROW_COUNT=500000) ===
+server_version: 16.15 (Debian 16.15-1.pgdg13+2)
+expand ADD COLUMN ... DEFAULT 'USD' took 5 ms
+  heap 28.7 MB -> 28.7 MB, total 39.5 MB -> 39.5 MB, WAL written 0.0 MB
+CONFIRMED     old pod SELECT amount works after expand
+CONFIRMED     old pod INSERT (no currency column) works after expand
+row inserted by an OLD pod for country=DE got currency='USD'
+CONFIRMED     old-pod rows silently default to USD even for DE (so the AI's one-off UPDATE cannot cover them)
+
+=== TEST 5: UPDATE cost vs constant-default ADD COLUMN ===
+full-table UPDATE (AI line 3-4) took 2942 ms on 500000 rows
+  heap 28.7 MB -> 61.3 MB (x2.13), total 39.5 MB -> 82.8 MB (x2.10)
+  WAL written: expand 0.0 MB vs UPDATE 116.9 MB (x82841)
+  naive linear extrapolation to 120M rows (x240): UPDATE WAL ~ 28061.9 MB, heap growth ~ 7813.1 MB. Back-of-envelope ONLY, not evidence of production behaviour.
+CONFIRMED     UPDATE roughly doubles the heap and writes orders of magnitude more WAL than the expand step
+
+=== TEST 6: plain CREATE INDEX vs CONCURRENTLY under load (ROW_COUNT=500000, 4 writers) ===
+--- plain CREATE INDEX
+    op took 305 ms
+    lock modes seen on invoices for the DDL backend: ShareLock
+    INSERT baseline: n=129 errors=0 p99=41ms max=41ms
+    INSERT during  : n=4 errors=0 p99=310ms max=310ms
+    SELECT baseline: n=279 errors=0 p99=3ms max=7ms
+    SELECT during  : n=165 errors=0 p99=5ms max=7ms
+--- CREATE INDEX CONCURRENTLY (no transaction block)
+    op took 555 ms
+    lock modes seen on invoices for the DDL backend: ShareUpdateExclusiveLock
+    INSERT baseline: n=131 errors=0 p99=41ms max=42ms
+    INSERT during  : n=134 errors=0 p99=66ms max=90ms
+    SELECT baseline: n=210 errors=0 p99=7ms max=12ms
+    SELECT during  : n=239 errors=0 p99=5ms max=6ms
+CONCURRENTLY index valid: true
+CONFIRMED     plain CREATE INDEX held ShareLock (conflicts with INSERT/UPDATE/DELETE)
+CONFIRMED     CONCURRENTLY held only ShareUpdateExclusiveLock (does not conflict with writes)
+latency comparison, worst INSERT during build: plain 310 ms vs concurrent 90 ms (inserts completed during build: plain 4 vs concurrent 134)
+
+=== TEST 7: plain ADD CHECK vs NOT VALID + VALIDATE under load (ROW_COUNT=500000) ===
+--- plain ADD CONSTRAINT CHECK (AI line 7 shape)
+    op took 59 ms
+    lock modes seen on invoices for the DDL backend: AccessExclusiveLock
+    INSERT baseline: n=132 errors=0 p99=37ms max=38ms
+    INSERT during  : n=4 errors=0 p99=67ms max=67ms
+    SELECT baseline: n=301 errors=0 p99=3ms max=4ms
+    SELECT during  : n=2 errors=0 p99=59ms max=59ms
+--- ADD CONSTRAINT ... NOT VALID
+    op took 14 ms
+    lock modes seen on invoices for the DDL backend: AccessExclusiveLock
+    INSERT baseline: n=153 errors=0 p99=15ms max=15ms
+    INSERT during  : n=4 errors=0 p99=49ms max=49ms
+    SELECT baseline: n=275 errors=0 p99=3ms max=3ms
+    SELECT during  : n=3 errors=0 p99=13ms max=13ms
+  convalidated after NOT VALID: false
+--- VALIDATE CONSTRAINT
+    op took 77 ms
+    lock modes seen on invoices for the DDL backend: ShareUpdateExclusiveLock
+    INSERT baseline: n=148 errors=0 p99=26ms max=26ms
+    INSERT during  : n=29 errors=0 p99=16ms max=16ms
+    SELECT baseline: n=309 errors=0 p99=2ms max=3ms
+    SELECT during  : n=44 errors=0 p99=3ms max=3ms
+  convalidated after VALIDATE: true
+CONFIRMED     plain ADD CHECK held AccessExclusiveLock while scanning (blocks reads AND writes)
+CONFIRMED     VALIDATE held only ShareUpdateExclusiveLock (reads and writes continue)
+latency comparison, worst SELECT during op: plain CHECK 59 ms vs VALIDATE 3 ms; worst INSERT: plain 67 ms vs VALIDATE 16 ms
+  note: NOT VALID itself briefly needs AccessExclusiveLock but does no scan (took 14 ms here)
+
+=== TEST 8: lock queue - queued DDL stalls plain SELECTs (the "app hangs" mechanism) ===
+NO lock_timeout: DDL succeeded after 1721 ms; plain SELECT that arrived 200 ms later waited 1512 ms
+lock_timeout=300ms: DDL FAILED fast (canceling statement due to lock timeout) after 304 ms; plain SELECT that arrived 200 ms later waited 93 ms
+CONFIRMED     without lock_timeout a trivial SELECT stalled behind the queued DDL for as long as the long transaction lived
+CONFIRMED     with lock_timeout the DDL failed fast and the SELECT stall was bounded (retry with backoff instead)
+
+=== TEST 9: AI up() wrapped in ONE transaction (runner behaviour), ROW_COUNT=200000 ===
+--- AI up() inside BEGIN ... COMMIT, load running
+    op took 2027 ms
+    lock modes seen on invoices for the DDL backend: AccessExclusiveLock, RowExclusiveLock, ShareLock
+    INSERT baseline: n=148 errors=0 p99=18ms max=18ms
+    INSERT during  : n=8 errors=8 p99=2023ms max=2023ms
+    SELECT baseline: n=299 errors=0 p99=2ms max=3ms
+    SELECT during  : n=4 errors=0 p99=2024ms max=2024ms
+    per-statement: line 2: 8 ms | line 3: 1399 ms | line 5: 313 ms | line 6: 1 ms | line 7: 22 ms
+    note: the old-pod writers/readers here use column "amount", so after the RENAME commits they error; look at "during ... errors" for that, and at max for the stall.
+CONFIRMED     a plain SELECT was blocked for ~2024 ms of a 2027 ms transaction (line 2 lock held until COMMIT)
+
+=== TEST 10: Plan B claims - what a cancelled step leaves behind (ROW_COUNT=500000) ===
+plain CREATE INDEX cancelled: finished=false err=canceling statement due to user request index row present=false
+CONFIRMED     cancelled plain CREATE INDEX rolls back cleanly: NO invalid index remains
+CREATE INDEX CONCURRENTLY cancelled: finished=false err=canceling statement due to user request index present=true indisvalid=false
+CONFIRMED     cancelled CONCURRENTLY build leaves an INVALID index that must be dropped
+after DROP INDEX CONCURRENTLY: index present=false
+VALIDATE CONSTRAINT cancelled: finished=false err=canceling statement due to user request convalidated=false
+CONFIRMED     cancelled VALIDATE leaves the constraint NOT VALID (still enforced on new writes), safe to retry
+
+=== SUMMARY ===
+T4/T5 expand compatible + UPDATE cost : CONFIRMED
+T6    index plain vs CONCURRENTLY      : CONFIRMED
+T7    CHECK plain vs NOT VALID/VALIDATE: CONFIRMED
+T8    lock queue / lock_timeout        : CONFIRMED
+T9    up() in one transaction          : CONFIRMED
+T10   Plan B cancel behaviour          : CONFIRMED

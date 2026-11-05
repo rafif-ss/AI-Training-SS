@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Webhook sample check</title>
+<style>
+  body { font-family: Georgia, serif; background: #f6f5f2; color: #1c1b19; margin: 32px auto; max-width: 920px; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  p { color: #444; }
+  pre { background: #1c1b19; color: #f4f1ea; padding: 20px; border-radius: 8px; overflow: auto; font-family: Consolas, monospace; font-size: 13px; line-height: 1.45; }
+  .fail { color: #ffb4a8; }
+  .ok { color: #b7e4c7; }
+</style>
+<h1>Webhook sample check</h1>
+<p>One saved provider event. No call to the provider. The AI handler rejects it. One recipe matches.</p>
+<pre>SAMPLE FROM THE PROVIDER DASHBOARD
+raw body: {"type":"payment.succeeded","data":{"order_id":"ord_42","url":"https:\/\/pay.example\/r\/ord_42"}}
+header X-Webhook-Signature: sha256=6fd5a08a1c56f72e69cfeef7062cc4358d30ac2ff400f362d4a50501bc09a31a
+
+WHAT THE AI SIGNS
+JSON.stringify(req.body): {"type":"payment.succeeded","data":{"order_id":"ord_42","url":"https://pay.example/r/ord_42"}}
+strings are identical: false
+AI hex: a4818dea16cf28181761427c8a500734811787b259c19b4c599c9b7f9d6ebd6c
+
+1. AI handler against the real sample
+req.headers['x-signature'] = undefined
+comparison sig !== expected is true
+<span class="fail">HTTP status: 401 bad signature</span>
+<span class="fail">result: FAIL as in staging. Every real event is rejected.</span>
+
+2. Which recipe matches the sample?
+no     AI: JSON.stringify, bare hex, header x-signature
+no     raw body, bare hex, compared to the whole header
+<span class="ok">MATCH  raw body, prefix sha256=, header X-Webhook-Signature</span>
+no     timestamp + "." + raw body
+
+3. Temporary bypass
+forged order_id ord_hacked, signature "not-a-signature"
+<span class="fail">strict AI check would answer 401</span>
+temporary bypass answers 200 and marks ord_hacked paid: true
+
+4. markOrderPaid throws
+AI catch block answers 200, so the provider does not retry
+fixed handler answers 500, so the provider retries
+
+<span class="ok">MATCHED RECIPE: raw body, prefix sha256=, header X-Webhook-Signature</span></pre>

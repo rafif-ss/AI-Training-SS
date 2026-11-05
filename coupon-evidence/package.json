@@ -1,0 +1,8 @@
+{
+  "name": "coupon-race-evidence",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
